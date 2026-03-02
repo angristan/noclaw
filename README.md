@@ -44,7 +44,7 @@ The absolute smallest fully autonomous AI assistant infrastructure. Until someon
 ## Quick Start
 
 ```sh
-git clone https://github.com/noclaw/noclaw.git
+git clone https://github.com/angristan/noclaw.git
 cd noclaw
 make release
 
