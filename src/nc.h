@@ -371,6 +371,10 @@ int nc_cmd_doctor(int argc, char **argv);
 /* Safe string copy */
 size_t nc_strlcpy(char *dst, const char *src, size_t dstsize);
 
+/* UTF-8 validation and boundary-safe truncation */
+size_t nc_utf8_sequence_len(const char *s, size_t len);
+size_t nc_utf8_safe_prefix(const char *s, size_t len, size_t max_bytes);
+
 /* Get $HOME */
 const char *nc_home_dir(void);
 
@@ -405,6 +409,8 @@ void nc_test_str(void);
 void nc_test_jwriter(void);
 void nc_test_memory(void);
 void nc_test_http(void);
+void nc_test_tools(void);
+void nc_test_provider(void);
 #endif
 
 #endif /* NC_H */

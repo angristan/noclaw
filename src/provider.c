@@ -20,36 +20,99 @@ typedef struct {
     char api_url[256];
 } provider_ctx;
 
-/* Escape a string for JSON, writing into buf+off. Returns new offset. */
-static int json_escape_into(char *buf, size_t bufsz, int off, const char *s) {
-    if (!s) return off;
-    for (; *s && (size_t)off < bufsz - 10; s++) {
-        switch (*s) {
-            case '"':  buf[off++] = '\\'; buf[off++] = '"';  break;
-            case '\\': buf[off++] = '\\'; buf[off++] = '\\'; break;
-            case '\n': buf[off++] = '\\'; buf[off++] = 'n';  break;
-            case '\r': buf[off++] = '\\'; buf[off++] = 'r';  break;
-            case '\t': buf[off++] = '\\'; buf[off++] = 't';  break;
-            default:
-                if ((unsigned char)*s >= 0x20)
-                    buf[off++] = *s;
-                break;
+static size_t json_escaped_size(const char *s) {
+    if (!s) return 0;
+
+    size_t len = strlen(s);
+    size_t size = 0;
+    for (size_t i = 0; i < len;) {
+        unsigned char c = (unsigned char)s[i];
+        if (c < 0x80) {
+            if (c == '"' || c == '\\' || c == '\n' || c == '\r' || c == '\t')
+                size += 2;
+            else if (c < 0x20)
+                size += 6;
+            else
+                size++;
+            i++;
+            continue;
         }
+
+        size_t n = nc_utf8_sequence_len(s + i, len - i);
+        if (n == 0) {
+            size += 6; /* malformed byte becomes \ufffd */
+            i++;
+        } else {
+            size += n;
+            i += n;
+        }
+    }
+    return size;
+}
+
+/* Escape a string for JSON while guaranteeing valid UTF-8 output. */
+static int json_escape_into(char *buf, size_t bufsz, int off, const char *s) {
+    if (!s || !buf || bufsz <= 10 || off < 0) return off;
+
+    static const char hex[] = "0123456789abcdef";
+    size_t len = strlen(s);
+    size_t limit = bufsz - 10; /* reserve space for the caller's closing syntax */
+
+    for (size_t i = 0; i < len && (size_t)off < limit;) {
+        unsigned char c = (unsigned char)s[i];
+        if (c >= 0x80) {
+            size_t n = nc_utf8_sequence_len(s + i, len - i);
+            if (n > 0) {
+                if (n > limit - (size_t)off) break;
+                memcpy(buf + off, s + i, n);
+                off += (int)n;
+                i += n;
+                continue;
+            }
+
+            if (limit - (size_t)off < 6) break;
+            memcpy(buf + off, "\\ufffd", 6);
+            off += 6;
+            i++;
+            continue;
+        }
+
+        if (c == '"' || c == '\\' || c == '\n' || c == '\r' || c == '\t') {
+            if (limit - (size_t)off < 2) break;
+            buf[off++] = '\\';
+            switch (c) {
+                case '"':  buf[off++] = '"';  break;
+                case '\\': buf[off++] = '\\'; break;
+                case '\n': buf[off++] = 'n';  break;
+                case '\r': buf[off++] = 'r';  break;
+                default:   buf[off++] = 't';  break;
+            }
+        } else if (c < 0x20) {
+            if (limit - (size_t)off < 6) break;
+            buf[off++] = '\\';
+            buf[off++] = 'u';
+            buf[off++] = '0';
+            buf[off++] = '0';
+            buf[off++] = hex[c >> 4];
+            buf[off++] = hex[c & 0x0f];
+        } else {
+            buf[off++] = (char)c;
+        }
+        i++;
     }
     return off;
 }
 
-/* Compute buffer size needed for messages (generous estimate) */
+/* Compute buffer size needed for messages. */
 static size_t estimate_messages_size(const nc_message *msgs, int count) {
     size_t sz = 512;
     for (int i = 0; i < count; i++) {
         sz += 256; /* per-message overhead */
-        if (msgs[i].content)
-            sz += strlen(msgs[i].content) * 2;
+        sz += json_escaped_size(msgs[i].content);
         /* tool_calls in assistant messages */
         for (int j = 0; j < msgs[i].tool_call_count; j++) {
             sz += 256; /* per-call overhead */
-            sz += strlen(msgs[i].tool_calls[j].arguments) * 2;
+            sz += json_escaped_size(msgs[i].tool_calls[j].arguments);
         }
     }
     return sz;
@@ -666,3 +729,39 @@ nc_provider nc_provider_anthropic(const char *api_key, const char *api_url) {
         .free = provider_free,
     };
 }
+
+#ifdef NC_TEST
+void nc_test_provider(void) {
+    char escaped[128] = {0};
+    const char invalid[] = { 'x', (char)0xff, 'y', '\0' };
+
+    int off = json_escape_into(escaped, sizeof(escaped), 0,
+                               "r\xc3\xa9sultat: \xe4\xbd\xa0\xe5\xa5\xbd \xf0\x9f\x91\x8b");
+    escaped[off] = '\0';
+    NC_ASSERT(strcmp(escaped, "r\xc3\xa9sultat: \xe4\xbd\xa0\xe5\xa5\xbd \xf0\x9f\x91\x8b") == 0,
+              "provider preserves valid UTF-8");
+
+    off = json_escape_into(escaped, sizeof(escaped), 0, invalid);
+    escaped[off] = '\0';
+    NC_ASSERT(strcmp(escaped, "x\\ufffdy") == 0,
+              "provider replaces malformed UTF-8");
+
+    nc_message msg = {
+        .role = "tool",
+        .content = "\xe7\xbb\x93\xe6\x9e\x9c \xf0\x9f\x91\x8b",
+        .tool_call_id = "call_utf8",
+    };
+    char messages[512];
+    int messages_len = openai_build_messages(messages, sizeof(messages), &msg, 1);
+
+    nc_arena a;
+    nc_arena_init(&a, 1024);
+    nc_json *arr = nc_json_parse(&a, messages, (size_t)messages_len);
+    nc_json *content = arr && arr->type == NC_JSON_ARRAY && arr->array.count == 1
+        ? nc_json_get(&arr->array.items[0], "content") : NULL;
+    NC_ASSERT(content && nc_str_eql(nc_json_str(content, ""),
+                                    "\xe7\xbb\x93\xe6\x9e\x9c \xf0\x9f\x91\x8b"),
+              "provider serializes UTF-8 tool result as valid JSON");
+    nc_arena_free(&a);
+}
+#endif

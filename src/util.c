@@ -62,6 +62,47 @@ size_t nc_strlcpy(char *dst, const char *src, size_t dstsize) {
     return srclen;
 }
 
+/* Return the length of one valid UTF-8 sequence, or zero if malformed. */
+size_t nc_utf8_sequence_len(const char *s, size_t len) {
+    if (!s || len == 0) return 0;
+
+    const unsigned char *p = (const unsigned char *)s;
+    unsigned char b0 = p[0];
+    if (b0 <= 0x7f) return 1;
+
+    if (b0 >= 0xc2 && b0 <= 0xdf) {
+        return len >= 2 && p[1] >= 0x80 && p[1] <= 0xbf ? 2 : 0;
+    }
+
+    if (b0 >= 0xe0 && b0 <= 0xef) {
+        if (len < 3 || p[2] < 0x80 || p[2] > 0xbf) return 0;
+        if (b0 == 0xe0) return p[1] >= 0xa0 && p[1] <= 0xbf ? 3 : 0;
+        if (b0 == 0xed) return p[1] >= 0x80 && p[1] <= 0x9f ? 3 : 0;
+        return p[1] >= 0x80 && p[1] <= 0xbf ? 3 : 0;
+    }
+
+    if (b0 >= 0xf0 && b0 <= 0xf4) {
+        if (len < 4 || p[2] < 0x80 || p[2] > 0xbf ||
+            p[3] < 0x80 || p[3] > 0xbf)
+            return 0;
+        if (b0 == 0xf0) return p[1] >= 0x90 && p[1] <= 0xbf ? 4 : 0;
+        if (b0 == 0xf4) return p[1] >= 0x80 && p[1] <= 0x8f ? 4 : 0;
+        return p[1] >= 0x80 && p[1] <= 0xbf ? 4 : 0;
+    }
+
+    return 0;
+}
+
+size_t nc_utf8_safe_prefix(const char *s, size_t len, size_t max_bytes) {
+    size_t pos = 0;
+    while (pos < len && pos < max_bytes) {
+        size_t n = nc_utf8_sequence_len(s + pos, len - pos);
+        if (n == 0 || n > max_bytes - pos) break;
+        pos += n;
+    }
+    return pos;
+}
+
 /* ── Home directory ───────────────────────────────────────────── */
 
 const char *nc_home_dir(void) {
@@ -198,5 +239,15 @@ void nc_test_str(void) {
 
     nc_path_join3(buf, sizeof(buf), "/home", ".noclaw", "config.json");
     NC_ASSERT(strcmp(buf, "/home/.noclaw/config.json") == 0, "path_join 3");
+
+    const char *utf8 = "A\xc3\xa9\xe4\xbd\xa0\xf0\x9f\x91\x8b";
+    NC_ASSERT(nc_utf8_safe_prefix(utf8, strlen(utf8), 10) == 10,
+              "utf8 prefix keeps complete sequences");
+    NC_ASSERT(nc_utf8_safe_prefix(utf8, strlen(utf8), 9) == 6,
+              "utf8 prefix drops partial four-byte sequence");
+    NC_ASSERT(nc_utf8_safe_prefix(utf8, strlen(utf8), 2) == 1,
+              "utf8 prefix drops partial two-byte sequence");
+    NC_ASSERT(nc_utf8_sequence_len("\xed\xa0\x80", 3) == 0,
+              "utf8 rejects surrogate code points");
 }
 #endif
